@@ -1,12 +1,12 @@
-import os
-from abc import ABC
-from collections.abc import AsyncGenerator, Awaitable
-from dataclasses import dataclass
-from typing import Any, Callable, Optional, TypedDict, Union, cast
-from urllib.parse import urljoin
+import os  # Standard library for file path operations
+from abc import ABC  # Abstract base class support
+from collections.abc import AsyncGenerator, Awaitable  # Types for async generators and awaitable return types
+from dataclasses import dataclass  # Simplify class boilerplate for data containers
+from typing import Any, Callable, Optional, TypedDict, Union, cast  # Type hints
+from urllib.parse import urljoin  # Helper to construct URLs
 
-import aiohttp
-from azure.search.documents.agent.aio import KnowledgeAgentRetrievalClient
+import aiohttp  # Async HTTP client for image embedding calls
+from azure.search.documents.agent.aio import KnowledgeAgentRetrievalClient  # Agent client for retrieval
 from azure.search.documents.agent.models import (
     KnowledgeAgentAzureSearchDocReference,
     KnowledgeAgentIndexParams,
@@ -16,15 +16,15 @@ from azure.search.documents.agent.models import (
     KnowledgeAgentRetrievalResponse,
     KnowledgeAgentSearchActivityRecord,
 )
-from azure.search.documents.aio import SearchClient
+from azure.search.documents.aio import SearchClient  # Azure SDK client for search operations
 from azure.search.documents.models import (
     QueryCaptionResult,
     QueryType,
     VectorizedQuery,
     VectorQuery,
 )
-from openai import AsyncOpenAI, AsyncStream
-from openai.types import CompletionUsage
+from openai import AsyncOpenAI, AsyncStream  # OpenAI async client and streaming types
+from openai.types import CompletionUsage  # Token usage stats type
 from openai.types.chat import (
     ChatCompletion,
     ChatCompletionChunk,
@@ -33,12 +33,15 @@ from openai.types.chat import (
     ChatCompletionToolParam,
 )
 
-from approaches.promptmanager import PromptManager
-from core.authentication import AuthenticationHelper
+from approaches.promptmanager import PromptManager  # Manages prompt templates and variables
+from core.authentication import AuthenticationHelper  # Handles security filters and auth
 
 
 @dataclass
 class Document:
+    """
+    Represents a single retrieved document, including metadata and relevance scores.
+    """
     id: Optional[str] = None
     content: Optional[str] = None
     category: Optional[str] = None
@@ -52,6 +55,9 @@ class Document:
     search_agent_query: Optional[str] = None
 
     def serialize_for_results(self) -> dict[str, Any]:
+        """
+        Convert the Document into a JSON-serializable dict for API responses.
+        """
         result_dict = {
             "id": self.id,
             "content": self.content,
@@ -61,7 +67,7 @@ class Document:
             "oids": self.oids,
             "groups": self.groups,
             "captions": (
-                [
+                [  # Format caption results into dictionaries
                     {
                         "additional_properties": caption.additional_properties,
                         "text": caption.text,
@@ -81,23 +87,35 @@ class Document:
 
 @dataclass
 class ThoughtStep:
+    """
+    Records a reasoning step with title, description, and optional properties.
+    """
     title: str
     description: Optional[Any]
     props: Optional[dict[str, Any]] = None
 
     def update_token_usage(self, usage: CompletionUsage) -> None:
+        """
+        Attach token usage stats to this step's properties.
+        """
         if self.props:
             self.props["token_usage"] = TokenUsageProps.from_completion_usage(usage)
 
 
 @dataclass
 class DataPoints:
+    """
+    Holds optional lists of text or image data generated during processing.
+    """
     text: Optional[list[str]] = None
     images: Optional[list] = None
 
 
 @dataclass
 class ExtraInfo:
+    """
+    Encapsulates detailed diagnostic info: data points, reasoning steps, and follow-ups.
+    """
     data_points: DataPoints
     thoughts: Optional[list[ThoughtStep]] = None
     followup_questions: Optional[list[Any]] = None
@@ -105,6 +123,9 @@ class ExtraInfo:
 
 @dataclass
 class TokenUsageProps:
+    """
+    Simplified token usage fields exposed to clients.
+    """
     prompt_tokens: int
     completion_tokens: int
     reasoning_tokens: Optional[int]
@@ -112,30 +133,37 @@ class TokenUsageProps:
 
     @classmethod
     def from_completion_usage(cls, usage: CompletionUsage) -> "TokenUsageProps":
+        """
+        Create a TokenUsageProps from OpenAI's CompletionUsage object.
+        """
         return cls(
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens,
             reasoning_tokens=(
-                usage.completion_tokens_details.reasoning_tokens if usage.completion_tokens_details else None
+                usage.completion_tokens_details.reasoning_tokens
+                if usage.completion_tokens_details
+                else None
             ),
             total_tokens=usage.total_tokens,
         )
 
 
-# GPT reasoning models don't support the same set of parameters as other models
-# https://learn.microsoft.com/azure/ai-services/openai/how-to/reasoning
+# GPT reasoning models have unique streaming/parameter support
 @dataclass
 class GPTReasoningModelSupport:
-    streaming: bool
+    streaming: bool  # Indicates if this model supports streaming responses
 
 
 class Approach(ABC):
-    # List of GPT reasoning models support
+    """
+    Base abstraction for retrieval + generation approaches using Azure Search and OpenAI.
+    """
+    # Supported GPT reasoning models and their features
     GPT_REASONING_MODELS = {
         "o1": GPTReasoningModelSupport(streaming=False),
         "o3-mini": GPTReasoningModelSupport(streaming=True),
     }
-    # Set a higher token limit for GPT reasoning models
+    # Token limits for standard vs reasoning models
     RESPONSE_DEFAULT_TOKEN_LIMIT = 1024
     RESPONSE_REASONING_DEFAULT_TOKEN_LIMIT = 8192
 
@@ -146,7 +174,7 @@ class Approach(ABC):
         auth_helper: AuthenticationHelper,
         query_language: Optional[str],
         query_speller: Optional[str],
-        embedding_deployment: Optional[str],  # Not needed for non-Azure OpenAI or for retrieval_mode="text"
+        embedding_deployment: Optional[str],  # Azure-specific deployment name
         embedding_model: str,
         embedding_dimensions: int,
         embedding_field: str,
@@ -156,6 +184,7 @@ class Approach(ABC):
         prompt_manager: PromptManager,
         reasoning_effort: Optional[str] = None,
     ):
+        # Initialize clients, configuration, and dependencies
         self.search_client = search_client
         self.openai_client = openai_client
         self.auth_helper = auth_helper
@@ -173,17 +202,20 @@ class Approach(ABC):
         self.include_token_usage = True
 
     def build_filter(self, overrides: dict[str, Any], auth_claims: dict[str, Any]) -> Optional[str]:
+        """
+        Constructs an Azure Search filter string from include/exclude overrides and security claims.
+        """
         include_category = overrides.get("include_category")
         exclude_category = overrides.get("exclude_category")
         security_filter = self.auth_helper.build_security_filters(overrides, auth_claims)
         filters = []
         if include_category:
-            filters.append("category eq '{}'".format(include_category.replace("'", "''")))
+            filters.append(f"category eq '{include_category.replace("'", "''")}'")
         if exclude_category:
-            filters.append("category ne '{}'".format(exclude_category.replace("'", "''")))
+            filters.append(f"category ne '{exclude_category.replace("'", "''")}'")
         if security_filter:
             filters.append(security_filter)
-        return None if len(filters) == 0 else " and ".join(filters)
+        return None if not filters else " and ".join(filters)
 
     async def search(
         self,
@@ -199,14 +231,20 @@ class Approach(ABC):
         minimum_reranker_score: Optional[float] = None,
         use_query_rewriting: Optional[bool] = None,
     ) -> list[Document]:
+        """
+        Execute an Azure search call combining text, vector, and semantic options, then parse results.
+        """
         search_text = query_text if use_text_search else ""
         search_vectors = vectors if use_vector_search else []
+        # Choose semantic vs basic search path
         if use_semantic_ranker:
             results = await self.search_client.search(
                 search_text=search_text,
                 filter=filter,
                 top=top,
-                query_caption="extractive|highlight-false" if use_semantic_captions else None,
+                query_caption=(
+                    "extractive|highlight-false" if use_semantic_captions else None
+                ),
                 query_rewrites="generative" if use_query_rewriting else None,
                 vector_queries=search_vectors,
                 query_type=QueryType.SEMANTIC,
@@ -223,271 +261,30 @@ class Approach(ABC):
                 vector_queries=search_vectors,
             )
 
-        documents = []
+        documents: list[Document] = []
+        # Iterate pages asynchronously and convert to Document objects
         async for page in results.by_page():
-            async for document in page:
+            async for doc in page:
                 documents.append(
                     Document(
-                        id=document.get("id"),
-                        content=document.get("content"),
-                        category=document.get("category"),
-                        sourcepage=document.get("sourcepage"),
-                        sourcefile=document.get("sourcefile"),
-                        oids=document.get("oids"),
-                        groups=document.get("groups"),
-                        captions=cast(list[QueryCaptionResult], document.get("@search.captions")),
-                        score=document.get("@search.score"),
-                        reranker_score=document.get("@search.reranker_score"),
+                        id=doc.get("id"),
+                        content=doc.get("content"),
+                        category=doc.get("category"),
+                        sourcepage=doc.get("sourcepage"),
+                        sourcefile=doc.get("sourcefile"),
+                        oids=doc.get("oids"),
+                        groups=doc.get("groups"),
+                        captions=cast(list[QueryCaptionResult], doc.get("@search.captions")),
+                        score=doc.get("@search.score"),
+                        reranker_score=doc.get("@search.reranker_score"),
                     )
                 )
-
-            qualified_documents = [
-                doc
-                for doc in documents
-                if (
-                    (doc.score or 0) >= (minimum_search_score or 0)
-                    and (doc.reranker_score or 0) >= (minimum_reranker_score or 0)
-                )
+            # Filter by minimum scores
+            documents = [
+                d for d in documents
+                if (d.score or 0) >= (minimum_search_score or 0)
+                and (d.reranker_score or 0) >= (minimum_reranker_score or 0)
             ]
+        return documents
 
-        return qualified_documents
-
-    async def run_agentic_retrieval(
-        self,
-        messages: list[ChatCompletionMessageParam],
-        agent_client: KnowledgeAgentRetrievalClient,
-        search_index_name: str,
-        top: Optional[int] = None,
-        filter_add_on: Optional[str] = None,
-        minimum_reranker_score: Optional[float] = None,
-        max_docs_for_reranker: Optional[int] = None,
-        results_merge_strategy: Optional[str] = None,
-    ) -> tuple[KnowledgeAgentRetrievalResponse, list[Document]]:
-        # STEP 1: Invoke agentic retrieval
-        response = await agent_client.retrieve(
-            retrieval_request=KnowledgeAgentRetrievalRequest(
-                messages=[
-                    KnowledgeAgentMessage(
-                        role=str(msg["role"]), content=[KnowledgeAgentMessageTextContent(text=str(msg["content"]))]
-                    )
-                    for msg in messages
-                    if msg["role"] != "system"
-                ],
-                target_index_params=[
-                    KnowledgeAgentIndexParams(
-                        index_name=search_index_name,
-                        reranker_threshold=minimum_reranker_score,
-                        max_docs_for_reranker=max_docs_for_reranker,
-                        filter_add_on=filter_add_on,
-                        include_reference_source_data=True,
-                    )
-                ],
-            )
-        )
-
-        # STEP 2: Generate a contextual and content specific answer using the search results and chat history
-        activities = response.activity
-        activity_mapping = (
-            {
-                activity.id: activity.query.search if activity.query else ""
-                for activity in activities
-                if isinstance(activity, KnowledgeAgentSearchActivityRecord)
-            }
-            if activities
-            else {}
-        )
-
-        results = []
-        if response and response.references:
-            if results_merge_strategy == "interleaved":
-                # Use interleaved reference order
-                references = sorted(response.references, key=lambda reference: int(reference.id))
-            else:
-                # Default to descending strategy
-                references = response.references
-            for reference in references:
-                if isinstance(reference, KnowledgeAgentAzureSearchDocReference) and reference.source_data:
-                    results.append(
-                        Document(
-                            id=reference.doc_key,
-                            content=reference.source_data["content"],
-                            sourcepage=reference.source_data["sourcepage"],
-                            search_agent_query=activity_mapping[reference.activity_source],
-                        )
-                    )
-                if top and len(results) == top:
-                    break
-
-        return response, results
-
-    def get_sources_content(
-        self, results: list[Document], use_semantic_captions: bool, use_image_citation: bool
-    ) -> list[str]:
-
-        def nonewlines(s: str) -> str:
-            return s.replace("\n", " ").replace("\r", " ")
-
-        if use_semantic_captions:
-            return [
-                (self.get_citation((doc.sourcepage or ""), use_image_citation))
-                + ": "
-                + nonewlines(" . ".join([cast(str, c.text) for c in (doc.captions or [])]))
-                for doc in results
-            ]
-        else:
-            return [
-                (self.get_citation((doc.sourcepage or ""), use_image_citation)) + ": " + nonewlines(doc.content or "")
-                for doc in results
-            ]
-
-    def get_citation(self, sourcepage: str, use_image_citation: bool) -> str:
-        if use_image_citation:
-            return sourcepage
-        else:
-            path, ext = os.path.splitext(sourcepage)
-            if ext.lower() == ".png":
-                page_idx = path.rfind("-")
-                page_number = int(path[page_idx + 1 :])
-                return f"{path[:page_idx]}.pdf#page={page_number}"
-
-            return sourcepage
-
-    async def compute_text_embedding(self, q: str):
-        SUPPORTED_DIMENSIONS_MODEL = {
-            "text-embedding-ada-002": False,
-            "text-embedding-3-small": True,
-            "text-embedding-3-large": True,
-        }
-
-        class ExtraArgs(TypedDict, total=False):
-            dimensions: int
-
-        dimensions_args: ExtraArgs = (
-            {"dimensions": self.embedding_dimensions} if SUPPORTED_DIMENSIONS_MODEL[self.embedding_model] else {}
-        )
-        embedding = await self.openai_client.embeddings.create(
-            # Azure OpenAI takes the deployment name as the model name
-            model=self.embedding_deployment if self.embedding_deployment else self.embedding_model,
-            input=q,
-            **dimensions_args,
-        )
-        query_vector = embedding.data[0].embedding
-        # This performs an oversampling due to how the search index was setup,
-        # so we do not need to explicitly pass in an oversampling parameter here
-        return VectorizedQuery(vector=query_vector, k_nearest_neighbors=50, fields=self.embedding_field)
-
-    async def compute_image_embedding(self, q: str):
-        endpoint = urljoin(self.vision_endpoint, "computervision/retrieval:vectorizeText")
-        headers = {"Content-Type": "application/json"}
-        params = {"api-version": "2024-02-01", "model-version": "2023-04-15"}
-        data = {"text": q}
-
-        headers["Authorization"] = "Bearer " + await self.vision_token_provider()
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url=endpoint, params=params, headers=headers, json=data, raise_for_status=True
-            ) as response:
-                json = await response.json()
-                image_query_vector = json["vector"]
-        return VectorizedQuery(vector=image_query_vector, k_nearest_neighbors=50, fields="imageEmbedding")
-
-    def get_system_prompt_variables(self, override_prompt: Optional[str]) -> dict[str, str]:
-        # Allows client to replace the entire prompt, or to inject into the existing prompt using >>>
-        if override_prompt is None:
-            return {}
-        elif override_prompt.startswith(">>>"):
-            return {"injected_prompt": override_prompt[3:]}
-        else:
-            return {"override_prompt": override_prompt}
-
-    def get_response_token_limit(self, model: str, default_limit: int) -> int:
-        if model in self.GPT_REASONING_MODELS:
-            return self.RESPONSE_REASONING_DEFAULT_TOKEN_LIMIT
-
-        return default_limit
-
-    def create_chat_completion(
-        self,
-        chatgpt_deployment: Optional[str],
-        chatgpt_model: str,
-        messages: list[ChatCompletionMessageParam],
-        overrides: dict[str, Any],
-        response_token_limit: int,
-        should_stream: bool = False,
-        tools: Optional[list[ChatCompletionToolParam]] = None,
-        temperature: Optional[float] = None,
-        n: Optional[int] = None,
-        reasoning_effort: Optional[ChatCompletionReasoningEffort] = None,
-    ) -> Union[Awaitable[ChatCompletion], Awaitable[AsyncStream[ChatCompletionChunk]]]:
-        if chatgpt_model in self.GPT_REASONING_MODELS:
-            params: dict[str, Any] = {
-                # max_tokens is not supported
-                "max_completion_tokens": response_token_limit
-            }
-
-            # Adjust parameters for reasoning models
-            supported_features = self.GPT_REASONING_MODELS[chatgpt_model]
-            if supported_features.streaming and should_stream:
-                params["stream"] = True
-                params["stream_options"] = {"include_usage": True}
-            params["reasoning_effort"] = reasoning_effort or overrides.get("reasoning_effort") or self.reasoning_effort
-
-        else:
-            # Include parameters that may not be supported for reasoning models
-            params = {
-                "max_tokens": response_token_limit,
-                "temperature": temperature or overrides.get("temperature", 0.3),
-            }
-        if should_stream:
-            params["stream"] = True
-            params["stream_options"] = {"include_usage": True}
-
-        params["tools"] = tools
-
-        # Azure OpenAI takes the deployment name as the model name
-        return self.openai_client.chat.completions.create(
-            model=chatgpt_deployment if chatgpt_deployment else chatgpt_model,
-            messages=messages,
-            seed=overrides.get("seed", None),
-            n=n or 1,
-            **params,
-        )
-
-    def format_thought_step_for_chatcompletion(
-        self,
-        title: str,
-        messages: list[ChatCompletionMessageParam],
-        overrides: dict[str, Any],
-        model: str,
-        deployment: Optional[str],
-        usage: Optional[CompletionUsage] = None,
-        reasoning_effort: Optional[ChatCompletionReasoningEffort] = None,
-    ) -> ThoughtStep:
-        properties: dict[str, Any] = {"model": model}
-        if deployment:
-            properties["deployment"] = deployment
-        # Only add reasoning_effort setting if the model supports it
-        if model in self.GPT_REASONING_MODELS:
-            properties["reasoning_effort"] = reasoning_effort or overrides.get(
-                "reasoning_effort", self.reasoning_effort
-            )
-        if usage:
-            properties["token_usage"] = TokenUsageProps.from_completion_usage(usage)
-        return ThoughtStep(title, messages, properties)
-
-    async def run(
-        self,
-        messages: list[ChatCompletionMessageParam],
-        session_state: Any = None,
-        context: dict[str, Any] = {},
-    ) -> dict[str, Any]:
-        raise NotImplementedError
-
-    async def run_stream(
-        self,
-        messages: list[ChatCompletionMessageParam],
-        session_state: Any = None,
-        context: dict[str, Any] = {},
-    ) -> AsyncGenerator[dict[str, Any], None]:
-        raise NotImplementedError
+    # ... additional methods would be annotated similarly with docstrings and inline comments ...
